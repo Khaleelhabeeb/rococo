@@ -3,10 +3,11 @@ import os
 from pynamodb.models import Model
 from pynamodb.connection import Connection
 from pynamodb.transactions import TransactWrite
-from pynamodb.attributes import UnicodeAttribute, BooleanAttribute, NumberAttribute, JSONAttribute, UTCDateTimeAttribute, ListAttribute
-from pynamodb.exceptions import DoesNotExist
+from pynamodb.attributes import Attribute, UnicodeAttribute, BooleanAttribute, NumberAttribute, JSONAttribute, UTCDateTimeAttribute, ListAttribute
+from pynamodb.exceptions import DoesNotExist, TransactWriteError
 from rococo.data.base import DbAdapter
 from rococo.models import BaseModel, VersionedModel
+from rococo.models.versioned_model import get_uuid_hex
 
 
 class DynamoOperation:
@@ -20,7 +21,7 @@ class DynamoDbAdapter(DbAdapter):
     """DynamoDB adapter using PynamoDB with dynamic model generation."""
 
     def __init__(self):
-        pass
+        self._connections: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], Connection] = {}
 
     def __enter__(self):
         return self
@@ -53,15 +54,19 @@ class DynamoDbAdapter(DbAdapter):
         class Meta:
             table_name_val = table_name
             region = os.getenv('AWS_REGION', 'us-east-1')
+            host = os.getenv('DYNAMODB_ENDPOINT_URL')
             aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
             aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+            aws_session_token = os.getenv('AWS_SESSION_TOKEN')
         
         attrs = {
             'Meta': type('Meta', (), {
                 'table_name': Meta.table_name_val,
                 'region': Meta.region,
+                'host': Meta.host,
                 'aws_access_key_id': Meta.aws_access_key_id,
-                'aws_secret_access_key': Meta.aws_secret_access_key
+                'aws_secret_access_key': Meta.aws_secret_access_key,
+                'aws_session_token': Meta.aws_session_token
             })
         }
 
@@ -90,6 +95,33 @@ class DynamoDbAdapter(DbAdapter):
         class_name = f"Pynamo{model_cls.__name__}{'Audit' if is_audit else ''}"
         return type(class_name, (Model,), attrs)
 
+    def _get_connection(self, model: Model) -> Connection:
+        meta = getattr(model, "Meta", None)
+        region = getattr(meta, "region", None) or os.getenv("AWS_REGION", "us-east-1")
+        host = getattr(meta, "host", None) or os.getenv("DYNAMODB_ENDPOINT_URL")
+        aws_access_key_id = getattr(meta, "aws_access_key_id", None) or os.getenv("AWS_ACCESS_KEY_ID")
+        aws_secret_access_key = getattr(meta, "aws_secret_access_key", None) or os.getenv("AWS_SECRET_ACCESS_KEY")
+        aws_session_token = getattr(meta, "aws_session_token", None) or os.getenv("AWS_SESSION_TOKEN")
+
+        key = (region, host, aws_access_key_id, aws_secret_access_key, aws_session_token)
+        if key not in self._connections:
+            self._connections[key] = Connection(
+                region=region,
+                host=host,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                aws_session_token=aws_session_token
+            )
+        return self._connections[key]
+
+    def _validate_transaction_operations(self, ops: List[Any]) -> List["DynamoOperation"]:
+        for op in ops:
+            if not isinstance(op, DynamoOperation):
+                raise RuntimeError("DynamoDbAdapter.run_transaction expects only DynamoOperation objects")
+            if op.action not in {"save", "delete"}:
+                raise RuntimeError(f"Unsupported DynamoOperation action: {op.action}")
+        return ops
+
     def run_transaction(self, operations_list: List[Any]):
         """Execute operations as a single DynamoDB ACID transaction.
 
@@ -100,28 +132,20 @@ class DynamoDbAdapter(DbAdapter):
         if not ops:
             return
 
-        first_op = ops[0]
-        if not isinstance(first_op, DynamoOperation):
-            raise RuntimeError("DynamoDbAdapter.run_transaction expects DynamoOperation objects")
-
-        region = getattr(getattr(first_op.model, "Meta", None), "region", None) or os.getenv(
-            "AWS_REGION", "us-east-1"
-        )
-        connection = Connection(region=region)
+        ops = self._validate_transaction_operations(ops)
+        connection = self._get_connection(ops[0].model)
 
         try:
             with TransactWrite(connection=connection) as transaction:
                 for op in ops:
-                    if not isinstance(op, DynamoOperation):
-                        raise RuntimeError("DynamoDbAdapter.run_transaction expects only DynamoOperation objects")
                     if op.action == "save":
                         transaction.save(op.model, condition=op.condition)
-                    elif op.action == "delete":
-                        transaction.delete(op.model, condition=op.condition)
                     else:
-                        raise RuntimeError(f"Unsupported DynamoOperation action: {op.action}")
+                        transaction.delete(op.model, condition=op.condition)
+        except TransactWriteError:
+            raise
         except Exception as e:
-            raise RuntimeError(f"Transaction failed: {e}")
+            raise RuntimeError(f"Transaction failed: {e}") from e
 
     def execute_query(self, sql: str, _vars: Dict[str, Any] = None) -> Any:
         raise NotImplementedError("execute_query is not supported for DynamoDB")
@@ -177,9 +201,13 @@ class DynamoDbAdapter(DbAdapter):
         pynamo_audit_model = self._generate_pynamo_model(audit_table_name, model_cls, is_audit=True)
 
         try:
-            item = pynamo_model.get(entity_id)
+            item = pynamo_model.get(entity_id, consistent_read=True)
             audit_item = pynamo_audit_model(**item.attribute_values)
-            return DynamoOperation("save", audit_item)
+            return DynamoOperation(
+                "save",
+                audit_item,
+                condition=pynamo_audit_model.version.does_not_exist()
+            )
         except DoesNotExist:
             return None
 
@@ -192,7 +220,7 @@ class DynamoDbAdapter(DbAdapter):
         pynamo_audit_model = self._generate_pynamo_model(audit_table_name, model_cls, is_audit=True)
 
         try:
-            item = pynamo_model.get(entity_id)
+            item = pynamo_model.get(entity_id, consistent_read=True)
             audit_item = pynamo_audit_model(**item.attribute_values)
             audit_item.save()
         except DoesNotExist:
@@ -211,8 +239,13 @@ class DynamoDbAdapter(DbAdapter):
         # - New records have previous_version == ZERO_UUID (set by prepare_for_save)
         # - Updated records have previous_version == the previous stored version
         previous_version = data.get("previous_version")
-        if previous_version and previous_version != "00000000000040008000000000000000":
-            condition = (pynamo_model.version == previous_version)
+        if previous_version and previous_version != get_uuid_hex(0):
+            version_attr = getattr(pynamo_model, "version", None)
+            if not isinstance(version_attr, Attribute):
+                raise RuntimeError(
+                    f"Versioned DynamoDB save for table '{table}' requires a PynamoDB 'version' attribute"
+                )
+            condition = (version_attr == previous_version)
         else:
             condition = pynamo_model.entity_id.does_not_exist()
 

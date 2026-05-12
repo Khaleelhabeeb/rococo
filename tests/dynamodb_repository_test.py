@@ -6,9 +6,10 @@ from unittest.mock import MagicMock, patch, ANY
 from typing import Type
 from pynamodb.models import Model
 from pynamodb.attributes import UnicodeAttribute, BooleanAttribute
-from rococo.data.dynamodb import DynamoDbAdapter
+from pynamodb.exceptions import TransactWriteError
+from rococo.data.dynamodb import DynamoDbAdapter, DynamoOperation
 from rococo.repositories.dynamodb.dynamodb_repository import DynamoDbRepository
-from rococo.models.versioned_model import VersionedModel
+from rococo.models.versioned_model import VersionedModel, get_uuid_hex
 from rococo.messaging import MessageAdapter
 
 # Dummy PynamoDB Models
@@ -56,6 +57,15 @@ class PersonAuditModel(Model):
 
     def save(self):
         pass
+
+class NoVersionModel:
+    class Meta:
+        table_name = 'person'
+        region = 'us-east-1'
+    entity_id = UnicodeAttribute(hash_key=True)
+
+    def __init__(self, **kwargs):
+        self.attribute_values = kwargs
 
 # Dummy Rococo Model
 @dataclass
@@ -151,6 +161,9 @@ class TestDynamoDbRepository(unittest.TestCase):
 
             self.assertEqual(saved_person.first_name, 'Jane')
             mock_tx.save.assert_called()
+            condition = mock_tx.save.call_args.kwargs["condition"]
+            self.assertIn("attribute_not_exists", str(condition))
+            self.assertIn("entity_id", str(condition))
             
             # Verify message was sent
             self.message_adapter.send_message.assert_called_with(
@@ -180,10 +193,15 @@ class TestDynamoDbRepository(unittest.TestCase):
                 self.repository.save(person, send_message=True)
 
                 # Ensure we tried to fetch the old record to audit it
-                mock_get.assert_called_with(entity_id)
+                mock_get.assert_called_with(entity_id, consistent_read=True)
 
                 # Ensure we called transaction.save twice (audit + new)
                 self.assertEqual(mock_tx.save.call_count, 2)
+                audit_condition = mock_tx.save.call_args_list[0].kwargs["condition"]
+                save_condition = mock_tx.save.call_args_list[1].kwargs["condition"]
+                self.assertIn("attribute_not_exists", str(audit_condition))
+                self.assertIn("version", str(audit_condition))
+                self.assertIn(old_version, str(save_condition))
 
                 # Verify message was sent
                 self.message_adapter.send_message.assert_called()
@@ -198,6 +216,61 @@ class TestDynamoDbRepository(unittest.TestCase):
 
             self.repository.delete(person)
             mock_tx.save.assert_called()
+
+    def test_get_save_query_uses_shared_zero_uuid_sentinel(self):
+        data = {
+            'entity_id': uuid4().hex,
+            'previous_version': get_uuid_hex(0),
+            'version': uuid4().hex,
+            'active': True,
+        }
+
+        operation = self.adapter.get_save_query('person', data, model_cls=Person)
+
+        self.assertIn("attribute_not_exists", str(operation.condition))
+        self.assertIn("entity_id", str(operation.condition))
+
+    def test_get_save_query_requires_version_attribute_for_updates(self):
+        data = {
+            'entity_id': uuid4().hex,
+            'previous_version': uuid4().hex,
+            'version': uuid4().hex,
+        }
+
+        with patch.object(self.adapter, '_generate_pynamo_model', return_value=NoVersionModel):
+            with self.assertRaisesRegex(RuntimeError, "requires a PynamoDB 'version' attribute"):
+                self.adapter.get_save_query('person', data, model_cls=Person)
+
+    def test_run_transaction_reraises_transact_write_error(self):
+        operation = DynamoOperation("save", PersonModel(entity_id=uuid4().hex))
+        error = TransactWriteError("conditional check failed")
+
+        with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+            mock_transact_write.return_value.__enter__.side_effect = error
+
+            with self.assertRaises(TransactWriteError) as context:
+                self.adapter.run_transaction([operation])
+
+        self.assertIs(context.exception, error)
+
+    def test_run_transaction_validates_operations_before_opening_transaction(self):
+        valid_operation = DynamoOperation("save", PersonModel(entity_id=uuid4().hex))
+
+        with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+            with self.assertRaisesRegex(RuntimeError, "expects only DynamoOperation objects"):
+                self.adapter.run_transaction([valid_operation, object()])
+
+        mock_transact_write.assert_not_called()
+
+    def test_run_transaction_reuses_cached_connection(self):
+        operation = DynamoOperation("save", PersonModel(entity_id=uuid4().hex))
+
+        with patch('rococo.data.dynamodb.Connection') as mock_connection:
+            with patch('rococo.data.dynamodb.TransactWrite'):
+                self.adapter.run_transaction([operation])
+                self.adapter.run_transaction([operation])
+
+        self.assertEqual(mock_connection.call_count, 1)
 
 
 if __name__ == '__main__':

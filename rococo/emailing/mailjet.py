@@ -71,6 +71,9 @@ class MailjetService(EmailService):
     def __call__(self, config: MailjetConfig, *args, **kwargs):
         super().__call__(config)
 
+        # Parse SOURCE_EMAIL which accepts two formats:
+        #   "Name <email@example.com>"  → {"Name": "Name", "Email": "email@example.com"}
+        #   "user@example.com"          → {"Name": "", "Email": "user@example.com"}
         match = re.match(r'^\s*(.*?)\s*<(.+)>\s*$', self.config.SOURCE_EMAIL)
         if match:
             name, email = match.groups()

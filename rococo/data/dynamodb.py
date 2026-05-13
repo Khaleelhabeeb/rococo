@@ -1,27 +1,42 @@
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
+import hashlib
 import os
 from pynamodb.models import Model
 from pynamodb.connection import Connection
 from pynamodb.transactions import TransactWrite
-from pynamodb.attributes import Attribute, UnicodeAttribute, BooleanAttribute, NumberAttribute, JSONAttribute, UTCDateTimeAttribute, ListAttribute
+from pynamodb.attributes import Attribute, UnicodeAttribute, BooleanAttribute, NumberAttribute, JSONAttribute, ListAttribute
 from pynamodb.exceptions import DoesNotExist, TransactWriteError
 from rococo.data.base import DbAdapter
-from rococo.models import BaseModel, VersionedModel
+from rococo.models import BaseModel
 from rococo.models.versioned_model import get_uuid_hex
+
+__all__ = ["DynamoDbAdapter", "DynamoOperation"]
 
 
 class DynamoOperation:
-    def __init__(self, action: str, model: Model, condition=None):
+    def __init__(
+        self,
+        action: str,
+        model: Union[Model, Type[Model]],
+        condition=None,
+        *,
+        audit_model: Type[Model] = None,
+        entity_id: str = None,
+        expected_version: str = None
+    ):
         self.action = action
         self.model = model
         self.condition = condition
+        self.audit_model = audit_model
+        self.entity_id = entity_id
+        self.expected_version = expected_version
 
 
 class DynamoDbAdapter(DbAdapter):
     """DynamoDB adapter using PynamoDB with dynamic model generation."""
 
     def __init__(self):
-        self._connections: Dict[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], Connection] = {}
+        self._connections: Dict[str, Connection] = {}
 
     def __enter__(self):
         return self
@@ -95,7 +110,40 @@ class DynamoDbAdapter(DbAdapter):
         class_name = f"Pynamo{model_cls.__name__}{'Audit' if is_audit else ''}"
         return type(class_name, (Model,), attrs)
 
-    def _get_connection(self, model: Model) -> Connection:
+    def _build_connection(
+        self,
+        region: str,
+        host: Optional[str],
+        aws_access_key_id: Optional[str],
+        aws_secret_access_key: Optional[str],
+        aws_session_token: Optional[str]
+    ) -> Connection:
+        return Connection(
+            region=region,
+            host=host,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token
+        )
+
+    def _connection_cache_key(
+        self,
+        region: str,
+        host: Optional[str],
+        aws_access_key_id: Optional[str],
+        aws_secret_access_key: Optional[str]
+    ) -> str:
+        key_material = "\x1f".join(
+            value or "" for value in (
+                region,
+                host,
+                aws_access_key_id,
+                aws_secret_access_key
+            )
+        )
+        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+
+    def _get_connection(self, model: Union[Model, Type[Model]]) -> Connection:
         meta = getattr(model, "Meta", None)
         region = getattr(meta, "region", None) or os.getenv("AWS_REGION", "us-east-1")
         host = getattr(meta, "host", None) or os.getenv("DYNAMODB_ENDPOINT_URL")
@@ -103,14 +151,23 @@ class DynamoDbAdapter(DbAdapter):
         aws_secret_access_key = getattr(meta, "aws_secret_access_key", None) or os.getenv("AWS_SECRET_ACCESS_KEY")
         aws_session_token = getattr(meta, "aws_session_token", None) or os.getenv("AWS_SESSION_TOKEN")
 
-        key = (region, host, aws_access_key_id, aws_secret_access_key, aws_session_token)
+        if aws_session_token:
+            return self._build_connection(
+                region,
+                host,
+                aws_access_key_id,
+                aws_secret_access_key,
+                aws_session_token
+            )
+
+        key = self._connection_cache_key(region, host, aws_access_key_id, aws_secret_access_key)
         if key not in self._connections:
-            self._connections[key] = Connection(
-                region=region,
-                host=host,
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-                aws_session_token=aws_session_token
+            self._connections[key] = self._build_connection(
+                region,
+                host,
+                aws_access_key_id,
+                aws_secret_access_key,
+                None
             )
         return self._connections[key]
 
@@ -118,9 +175,32 @@ class DynamoDbAdapter(DbAdapter):
         for op in ops:
             if not isinstance(op, DynamoOperation):
                 raise RuntimeError("DynamoDbAdapter.run_transaction expects only DynamoOperation objects")
-            if op.action not in {"save", "delete"}:
+            if op.action not in {"save", "delete", "audit_save"}:
                 raise RuntimeError(f"Unsupported DynamoOperation action: {op.action}")
         return ops
+
+    def _resolve_audit_operation(self, op: DynamoOperation) -> Optional[DynamoOperation]:
+        if op.audit_model is None or op.entity_id is None:
+            raise RuntimeError("Dynamo audit operation requires audit_model and entity_id")
+
+        # DynamoDB cannot read an item and write a derived audit copy in one
+        # TransactWrite action. The source read is therefore deferred until
+        # transaction execution, verified against the expected version here,
+        # and guarded again by the main-table save condition in the same write.
+        try:
+            item = op.model.get(op.entity_id, consistent_read=True)
+        except DoesNotExist:
+            return None
+
+        item_version = item.attribute_values.get("version")
+        if op.expected_version and item_version != op.expected_version:
+            raise RuntimeError(
+                f"DynamoDB audit snapshot version mismatch for entity_id={op.entity_id}: "
+                f"expected {op.expected_version}, found {item_version}"
+            )
+
+        audit_item = op.audit_model(**item.attribute_values)
+        return DynamoOperation("save", audit_item, condition=op.condition)
 
     def run_transaction(self, operations_list: List[Any]):
         """Execute operations as a single DynamoDB ACID transaction.
@@ -138,6 +218,11 @@ class DynamoDbAdapter(DbAdapter):
         try:
             with TransactWrite(connection=connection) as transaction:
                 for op in ops:
+                    if op.action == "audit_save":
+                        op = self._resolve_audit_operation(op)
+                        if op is None:
+                            continue
+
                     if op.action == "save":
                         transaction.save(op.model, condition=op.condition)
                     else:
@@ -192,7 +277,21 @@ class DynamoDbAdapter(DbAdapter):
         except Exception as e:
             raise RuntimeError(f"get_count failed: {e}")
 
-    def get_move_entity_to_audit_table_query(self, table, entity_id, model_cls: Type[BaseModel] = None):
+    def get_move_entity_to_audit_table_query(
+        self,
+        table,
+        entity_id,
+        model_cls: Type[BaseModel] = None,
+        expected_version: str = None
+    ):
+        """Return a deferred operation that snapshots the current item into audit.
+
+        The source item is read inside run_transaction, not while building the
+        operation. The main-table save operation must still carry the
+        previous_version condition; that condition is the commit-time guard that
+        aborts the whole transaction if another writer changes the source row
+        after the audit snapshot read.
+        """
         if model_cls is None:
             raise ValueError("model_cls is required for DynamoDB move_entity_to_audit_table")
 
@@ -200,16 +299,14 @@ class DynamoDbAdapter(DbAdapter):
         audit_table_name = f"{table}_audit"
         pynamo_audit_model = self._generate_pynamo_model(audit_table_name, model_cls, is_audit=True)
 
-        try:
-            item = pynamo_model.get(entity_id, consistent_read=True)
-            audit_item = pynamo_audit_model(**item.attribute_values)
-            return DynamoOperation(
-                "save",
-                audit_item,
-                condition=pynamo_audit_model.version.does_not_exist()
-            )
-        except DoesNotExist:
-            return None
+        return DynamoOperation(
+            "audit_save",
+            pynamo_model,
+            condition=pynamo_audit_model.version.does_not_exist(),
+            audit_model=pynamo_audit_model,
+            entity_id=entity_id,
+            expected_version=expected_version
+        )
 
     def move_entity_to_audit_table(self, table_name: str, entity_id: str, model_cls: Type[BaseModel] = None):
         if model_cls is None:
@@ -240,6 +337,8 @@ class DynamoDbAdapter(DbAdapter):
         # - Updated records have previous_version == the previous stored version
         previous_version = data.get("previous_version")
         if previous_version and previous_version != get_uuid_hex(0):
+            # PynamoDB exposes condition-capable attributes on the model class.
+            # Instance-level values are plain Python data and cannot build expressions.
             version_attr = getattr(pynamo_model, "version", None)
             if not isinstance(version_attr, Attribute):
                 raise RuntimeError(
@@ -259,6 +358,23 @@ class DynamoDbAdapter(DbAdapter):
         item = pynamo_model(**data)
         item.save()
         return item.attribute_values
+
+    def get_by_id(
+        self,
+        table: str,
+        entity_id: str,
+        model_cls: Type[BaseModel] = None,
+        consistent_read: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        if model_cls is None:
+            raise ValueError("model_cls is required for DynamoDB get_by_id")
+
+        pynamo_model = self._generate_pynamo_model(table, model_cls)
+        try:
+            item = pynamo_model.get(entity_id, consistent_read=consistent_read)
+            return item.attribute_values
+        except DoesNotExist:
+            return None
 
     def upsert(self, table: str, data: Dict[str, Any], model_cls: Type[BaseModel] = None) -> Union[Dict[str, Any], None]:
         """

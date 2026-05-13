@@ -45,6 +45,21 @@ class DynamoDbRepository(BaseRepository):
         )
         return data
 
+    def _read_committed_state(self, entity_id: str) -> Dict[str, Any]:
+        saved = self._execute_within_context(
+            lambda: self.adapter.get_by_id(
+                table=self.table_name,
+                entity_id=entity_id,
+                model_cls=self.model,
+                consistent_read=True
+            )
+        )
+        if not saved:
+            raise RuntimeError(
+                f"DynamoDB transaction committed but entity_id={entity_id} could not be read back"
+            )
+        return saved
+
     def get_one(
         self,
         conditions: Dict[str, Any],
@@ -117,7 +132,8 @@ class DynamoDbRepository(BaseRepository):
                     audit_op = self.adapter.get_move_entity_to_audit_table_query(
                         self.table_name,
                         instance.entity_id,
-                        model_cls=self.model
+                        model_cls=self.model,
+                        expected_version=previous_version
                     )
                     if audit_op:
                         ops.append(audit_op)
@@ -131,7 +147,7 @@ class DynamoDbRepository(BaseRepository):
             )
 
             self._execute_within_context(lambda: self.adapter.run_transaction(ops))
-            saved = payload
+            saved = self._read_committed_state(payload["entity_id"])
         else:
             saved = self._execute_within_context(
                 lambda: self.adapter.upsert(self.table_name, payload, model_cls=self.model)
@@ -187,7 +203,8 @@ class DynamoDbRepository(BaseRepository):
                     audit_op = self.adapter.get_move_entity_to_audit_table_query(
                         self.table_name,
                         data['entity_id'],
-                        model_cls=self.model
+                        model_cls=self.model,
+                        expected_version=previous_version
                     )
                     if audit_op:
                         ops.append(audit_op)
@@ -201,7 +218,7 @@ class DynamoDbRepository(BaseRepository):
             )
 
             self._execute_within_context(lambda: self.adapter.run_transaction(ops))
-            saved = data
+            saved = self._read_committed_state(data["entity_id"])
 
             if saved:
                 for k, v in saved.items():

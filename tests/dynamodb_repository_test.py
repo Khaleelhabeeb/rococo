@@ -153,13 +153,25 @@ class TestDynamoDbRepository(unittest.TestCase):
         # Test saving a new record
         person = Person(first_name='Jane', last_name='Doe')
 
-        with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+        with patch.object(self.adapter, 'get_by_id') as mock_get_by_id:
+            mock_get_by_id.side_effect = lambda table, entity_id, model_cls, consistent_read: {
+                'entity_id': entity_id,
+                'first_name': 'Jane',
+                'last_name': 'Persisted',
+                'active': True,
+            }
+            transact_patch = patch('rococo.data.dynamodb.TransactWrite')
+            mock_transact_write = transact_patch.start()
+            self.addCleanup(transact_patch.stop)
             mock_tx = MagicMock()
             mock_transact_write.return_value.__enter__.return_value = mock_tx
 
             saved_person = self.repository.save(person, send_message=True)
 
             self.assertEqual(saved_person.first_name, 'Jane')
+            self.assertEqual(saved_person.last_name, 'Persisted')
+            mock_get_by_id.assert_called_once()
+            self.assertTrue(mock_get_by_id.call_args.kwargs["consistent_read"])
             mock_tx.save.assert_called()
             condition = mock_tx.save.call_args.kwargs["condition"]
             self.assertIn("attribute_not_exists", str(condition))
@@ -183,10 +195,26 @@ class TestDynamoDbRepository(unittest.TestCase):
         # Mock the 'get' call used by move_entity_to_audit_table
         with patch.object(PersonModel, 'get') as mock_get:
             mock_item = MagicMock()
-            mock_item.attribute_values = {'entity_id': entity_id, 'first_name': 'Jane', 'active': True}
+            mock_item.attribute_values = {
+                'entity_id': entity_id,
+                'first_name': 'Jane',
+                'active': True,
+                'version': old_version,
+            }
             mock_get.return_value = mock_item
             
-            with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+            with patch.object(self.adapter, 'get_by_id') as mock_get_by_id:
+                mock_get_by_id.side_effect = lambda table, entity_id, model_cls, consistent_read: {
+                    'entity_id': entity_id,
+                    'first_name': 'Jane',
+                    'last_name': 'Doe',
+                    'active': True,
+                    'version': person.version,
+                    'previous_version': old_version,
+                }
+                transact_patch = patch('rococo.data.dynamodb.TransactWrite')
+                mock_transact_write = transact_patch.start()
+                self.addCleanup(transact_patch.stop)
                 mock_tx = MagicMock()
                 mock_transact_write.return_value.__enter__.return_value = mock_tx
 
@@ -202,6 +230,7 @@ class TestDynamoDbRepository(unittest.TestCase):
                 self.assertIn("attribute_not_exists", str(audit_condition))
                 self.assertIn("version", str(audit_condition))
                 self.assertIn(old_version, str(save_condition))
+                mock_get_by_id.assert_called_once()
 
                 # Verify message was sent
                 self.message_adapter.send_message.assert_called()
@@ -210,12 +239,66 @@ class TestDynamoDbRepository(unittest.TestCase):
         person = Person(first_name='Jane')
         person.entity_id = uuid4().hex
 
-        with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+        with patch.object(self.adapter, 'get_by_id') as mock_get_by_id:
+            mock_get_by_id.side_effect = lambda table, entity_id, model_cls, consistent_read: {
+                'entity_id': entity_id,
+                'first_name': 'Jane',
+                'active': False,
+            }
+            transact_patch = patch('rococo.data.dynamodb.TransactWrite')
+            mock_transact_write = transact_patch.start()
+            self.addCleanup(transact_patch.stop)
             mock_tx = MagicMock()
             mock_transact_write.return_value.__enter__.return_value = mock_tx
 
             self.repository.delete(person)
+            self.assertFalse(person.active)
+            mock_get_by_id.assert_called_once()
             mock_tx.save.assert_called()
+
+    def test_get_move_entity_to_audit_table_query_is_deferred(self):
+        entity_id = uuid4().hex
+        old_version = uuid4().hex
+
+        with patch.object(PersonModel, 'get') as mock_get:
+            operation = self.adapter.get_move_entity_to_audit_table_query(
+                'person',
+                entity_id,
+                model_cls=Person,
+                expected_version=old_version
+            )
+
+        mock_get.assert_not_called()
+        self.assertEqual(operation.action, "audit_save")
+        self.assertEqual(operation.entity_id, entity_id)
+        self.assertEqual(operation.expected_version, old_version)
+
+    def test_audit_operation_rejects_snapshot_version_mismatch(self):
+        entity_id = uuid4().hex
+        old_version = uuid4().hex
+        operation = self.adapter.get_move_entity_to_audit_table_query(
+            'person',
+            entity_id,
+            model_cls=Person,
+            expected_version=old_version
+        )
+
+        with patch.object(PersonModel, 'get') as mock_get:
+            mock_item = MagicMock()
+            mock_item.attribute_values = {
+                'entity_id': entity_id,
+                'version': uuid4().hex,
+            }
+            mock_get.return_value = mock_item
+
+            with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+                mock_tx = MagicMock()
+                mock_transact_write.return_value.__enter__.return_value = mock_tx
+
+                with self.assertRaisesRegex(RuntimeError, "audit snapshot version mismatch"):
+                    self.adapter.run_transaction([operation])
+
+        mock_tx.save.assert_not_called()
 
     def test_get_save_query_uses_shared_zero_uuid_sentinel(self):
         data = {
@@ -263,14 +346,46 @@ class TestDynamoDbRepository(unittest.TestCase):
         mock_transact_write.assert_not_called()
 
     def test_run_transaction_reuses_cached_connection(self):
+        adapter = DynamoDbAdapter()
         operation = DynamoOperation("save", PersonModel(entity_id=uuid4().hex))
 
-        with patch('rococo.data.dynamodb.Connection') as mock_connection:
-            with patch('rococo.data.dynamodb.TransactWrite'):
-                self.adapter.run_transaction([operation])
-                self.adapter.run_transaction([operation])
+        with patch.dict(os.environ, {'AWS_SESSION_TOKEN': ''}):
+            with patch('rococo.data.dynamodb.Connection') as mock_connection:
+                with patch('rococo.data.dynamodb.TransactWrite'):
+                    adapter.run_transaction([operation])
+                    adapter.run_transaction([operation])
 
         self.assertEqual(mock_connection.call_count, 1)
+
+    def test_connection_cache_key_does_not_expose_secret(self):
+        adapter = DynamoDbAdapter()
+        operation = DynamoOperation("save", PersonModel(entity_id=uuid4().hex))
+        secret = "very-secret-value"
+
+        with patch.dict(os.environ, {'AWS_SECRET_ACCESS_KEY': secret, 'AWS_SESSION_TOKEN': ''}):
+            with patch('rococo.data.dynamodb.Connection'):
+                with patch('rococo.data.dynamodb.TransactWrite'):
+                    adapter.run_transaction([operation])
+
+        self.assertNotIn(secret, repr(adapter._connections))
+
+    def test_session_token_connections_are_not_cached(self):
+        adapter = DynamoDbAdapter()
+        operation = DynamoOperation("save", PersonModel(entity_id=uuid4().hex))
+
+        with patch.dict(os.environ, {'AWS_SESSION_TOKEN': 'short-lived-token'}):
+            with patch('rococo.data.dynamodb.Connection') as mock_connection:
+                with patch('rococo.data.dynamodb.TransactWrite'):
+                    adapter.run_transaction([operation])
+                    adapter.run_transaction([operation])
+
+        self.assertEqual(mock_connection.call_count, 2)
+        self.assertEqual(adapter._connections, {})
+
+    def test_dynamo_operation_is_publicly_exported(self):
+        from rococo.data import DynamoOperation as ExportedDynamoOperation
+
+        self.assertIs(ExportedDynamoOperation, DynamoOperation)
 
 
 if __name__ == '__main__':

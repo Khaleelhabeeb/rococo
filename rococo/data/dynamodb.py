@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import hashlib
 import os
@@ -12,24 +13,23 @@ from rococo.models.versioned_model import get_uuid_hex
 
 __all__ = ["DynamoDbAdapter", "DynamoOperation"]
 
+MAX_TRANSACTION_ITEMS = 100
 
+
+@dataclass
 class DynamoOperation:
-    def __init__(
-        self,
-        action: str,
-        model: Union[Model, Type[Model]],
-        condition=None,
-        *,
-        audit_model: Type[Model] = None,
-        entity_id: str = None,
-        expected_version: str = None
-    ):
-        self.action = action
-        self.model = model
-        self.condition = condition
-        self.audit_model = audit_model
-        self.entity_id = entity_id
-        self.expected_version = expected_version
+    """Typed transaction operation for DynamoDB.
+
+    For save/delete operations, `model` is a PynamoDB model instance. For
+    audit_save operations, `model` is the source PynamoDB model class and
+    `audit_model` is the destination audit model class.
+    """
+    action: str
+    model: Union[Model, Type[Model]]
+    condition: Any = None
+    audit_model: Type[Model] = None
+    entity_id: str = None
+    expected_version: str = None
 
 
 class DynamoDbAdapter(DbAdapter):
@@ -37,6 +37,8 @@ class DynamoDbAdapter(DbAdapter):
 
     def __init__(self):
         self._connections: Dict[str, Connection] = {}
+        self._pynamo_models: Dict[Tuple[str, Type[BaseModel], bool, str], Type[Model]] = {}
+        self._model_classes_by_table: Dict[str, Type[BaseModel]] = {}
 
     def __enter__(self):
         return self
@@ -62,17 +64,56 @@ class DynamoDbAdapter(DbAdapter):
         # Default to UnicodeAttribute for str and others
         return UnicodeAttribute(**kwargs)
 
+    def _model_cache_digest(
+        self,
+        region: Optional[str],
+        host: Optional[str],
+        aws_access_key_id: Optional[str],
+        aws_secret_access_key: Optional[str]
+    ) -> str:
+        key_material = "\x1f".join(
+            value or "" for value in (
+                region,
+                host,
+                aws_access_key_id,
+                aws_secret_access_key
+            )
+        )
+        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+
+    def _resolve_model_cls(self, table_name: str, model_cls: Type[BaseModel] = None) -> Type[BaseModel]:
+        if model_cls is not None:
+            self._model_classes_by_table[table_name] = model_cls
+            return model_cls
+
+        cached_model_cls = self._model_classes_by_table.get(table_name)
+        if cached_model_cls is not None:
+            return cached_model_cls
+
+        raise ValueError("model_cls is required for DynamoDB operations until the table model has been registered")
+
     def _generate_pynamo_model(self, table_name: str, model_cls: Type[BaseModel], is_audit: bool = False) -> Type[Model]:
         """Dynamically generate a PynamoDB Model class from a Rococo BaseModel or VersionedModel."""
+        model_cls = self._resolve_model_cls(table_name, model_cls)
         
         # 1. Define Meta
         class Meta:
             table_name_val = table_name
             region = os.getenv('AWS_REGION', 'us-east-1')
-            host = os.getenv('DYNAMODB_ENDPOINT_URL')
-            aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
-            aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-            aws_session_token = os.getenv('AWS_SESSION_TOKEN')
+            host = os.getenv('DYNAMODB_ENDPOINT_URL') or None
+            aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID') or None
+            aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY') or None
+            aws_session_token = os.getenv('AWS_SESSION_TOKEN') or None
+
+        cache_digest = self._model_cache_digest(
+            Meta.region,
+            Meta.host,
+            Meta.aws_access_key_id,
+            Meta.aws_secret_access_key
+        )
+        cache_key = (table_name, model_cls, is_audit, cache_digest)
+        if not Meta.aws_session_token and cache_key in self._pynamo_models:
+            return self._pynamo_models[cache_key]
         
         attrs = {
             'Meta': type('Meta', (), {
@@ -108,7 +149,10 @@ class DynamoDbAdapter(DbAdapter):
 
         # 3. Create class
         class_name = f"Pynamo{model_cls.__name__}{'Audit' if is_audit else ''}"
-        return type(class_name, (Model,), attrs)
+        pynamo_model = type(class_name, (Model,), attrs)
+        if not Meta.aws_session_token:
+            self._pynamo_models[cache_key] = pynamo_model
+        return pynamo_model
 
     def _build_connection(
         self,
@@ -146,10 +190,10 @@ class DynamoDbAdapter(DbAdapter):
     def _get_connection(self, model: Union[Model, Type[Model]]) -> Connection:
         meta = getattr(model, "Meta", None)
         region = getattr(meta, "region", None) or os.getenv("AWS_REGION", "us-east-1")
-        host = getattr(meta, "host", None) or os.getenv("DYNAMODB_ENDPOINT_URL")
-        aws_access_key_id = getattr(meta, "aws_access_key_id", None) or os.getenv("AWS_ACCESS_KEY_ID")
-        aws_secret_access_key = getattr(meta, "aws_secret_access_key", None) or os.getenv("AWS_SECRET_ACCESS_KEY")
-        aws_session_token = getattr(meta, "aws_session_token", None) or os.getenv("AWS_SESSION_TOKEN")
+        host = getattr(meta, "host", None) or os.getenv("DYNAMODB_ENDPOINT_URL") or None
+        aws_access_key_id = getattr(meta, "aws_access_key_id", None) or os.getenv("AWS_ACCESS_KEY_ID") or None
+        aws_secret_access_key = getattr(meta, "aws_secret_access_key", None) or os.getenv("AWS_SECRET_ACCESS_KEY") or None
+        aws_session_token = getattr(meta, "aws_session_token", None) or os.getenv("AWS_SESSION_TOKEN") or None
 
         if aws_session_token:
             return self._build_connection(
@@ -176,12 +220,88 @@ class DynamoDbAdapter(DbAdapter):
             if not isinstance(op, DynamoOperation):
                 raise RuntimeError("DynamoDbAdapter.run_transaction expects only DynamoOperation objects")
             if op.action not in {"save", "delete", "audit_save"}:
-                raise RuntimeError(f"Unsupported DynamoOperation action: {op.action}")
+                raise ValueError(f"Unknown DynamoOperation action: '{op.action}'")
         return ops
+
+    def _table_name_for(self, model: Union[Model, Type[Model]]) -> Optional[str]:
+        return getattr(getattr(model, "Meta", None), "table_name", None)
+
+    def _entity_id_for(self, model: Model) -> Optional[str]:
+        attribute_values = getattr(model, "attribute_values", {}) or {}
+        return attribute_values.get("entity_id") or getattr(model, "entity_id", None)
+
+    def _operation_source_key(self, op: DynamoOperation) -> Optional[Tuple[str, str]]:
+        if op.action == "audit_save":
+            if op.entity_id is None:
+                return None
+            table_name = self._table_name_for(op.model)
+            if table_name is None:
+                return None
+            return (table_name, op.entity_id)
+
+        if op.action in {"save", "delete"} and isinstance(op.model, Model):
+            entity_id = self._entity_id_for(op.model)
+            if entity_id is None:
+                return None
+            table_name = self._table_name_for(op.model)
+            if table_name is None:
+                return None
+            return (table_name, entity_id)
+
+        return None
+
+    def _source_write_guards(self, ops: List[DynamoOperation]) -> Dict[Tuple[str, str], str]:
+        guards: Dict[Tuple[str, str], str] = {}
+        for op in ops:
+            if op.action not in {"save", "delete"} or op.condition is None or op.expected_version is None:
+                continue
+
+            source_key = self._operation_source_key(op)
+            if source_key is not None:
+                guards[source_key] = op.expected_version
+
+        return guards
+
+    def _is_source_guarded_by_write(
+        self,
+        op: DynamoOperation,
+        source_write_guards: Dict[Tuple[str, str], str]
+    ) -> bool:
+        source_key = self._operation_source_key(op)
+        if source_key is None:
+            return False
+        return source_write_guards.get(source_key) == op.expected_version
+
+    def _estimate_transaction_item_count(self, ops: List[DynamoOperation]) -> int:
+        source_write_guards = self._source_write_guards(ops)
+        item_count = 0
+        for op in ops:
+            item_count += 1
+            if op.action == "audit_save" and not self._is_source_guarded_by_write(op, source_write_guards):
+                item_count += 1
+        return item_count
+
+    def _validate_transaction_item_count(self, ops: List[DynamoOperation]) -> None:
+        item_count = self._estimate_transaction_item_count(ops)
+        if item_count > MAX_TRANSACTION_ITEMS:
+            raise ValueError(
+                f"DynamoDB transactions support at most {MAX_TRANSACTION_ITEMS} items; got {item_count}"
+            )
+
+    def _version_condition(self, model_cls: Type[Model], expected_version: str):
+        version_attr = getattr(model_cls, "version", None)
+        if not isinstance(version_attr, Attribute):
+            table_name = self._table_name_for(model_cls) or "<unknown>"
+            raise RuntimeError(
+                f"Versioned DynamoDB operation for table '{table_name}' requires a PynamoDB 'version' attribute"
+            )
+        return version_attr == expected_version
 
     def _resolve_audit_operation(self, op: DynamoOperation) -> Optional[DynamoOperation]:
         if op.audit_model is None or op.entity_id is None:
             raise RuntimeError("Dynamo audit operation requires audit_model and entity_id")
+        if op.expected_version is None or op.expected_version == "":
+            raise RuntimeError("Dynamo audit operation requires a non-empty expected_version")
 
         # DynamoDB cannot read an item and write a derived audit copy in one
         # TransactWrite action. The source read is therefore deferred until
@@ -193,7 +313,7 @@ class DynamoDbAdapter(DbAdapter):
             return None
 
         item_version = item.attribute_values.get("version")
-        if op.expected_version and item_version != op.expected_version:
+        if op.expected_version is not None and item_version != op.expected_version:
             raise RuntimeError(
                 f"DynamoDB audit snapshot version mismatch for entity_id={op.entity_id}: "
                 f"expected {op.expected_version}, found {item_version}"
@@ -201,6 +321,21 @@ class DynamoDbAdapter(DbAdapter):
 
         audit_item = op.audit_model(**item.attribute_values)
         return DynamoOperation("save", audit_item, condition=op.condition)
+
+    def _add_source_condition_check(self, transaction, op: DynamoOperation) -> None:
+        transaction.condition_check(
+            op.model,
+            op.entity_id,
+            condition=self._version_condition(op.model, op.expected_version)
+        )
+
+    def _apply_transaction_operation(self, transaction, op: DynamoOperation) -> None:
+        if op.action == "save":
+            transaction.save(op.model, condition=op.condition)
+        elif op.action == "delete":
+            transaction.delete(op.model, condition=op.condition)
+        else:
+            raise ValueError(f"Unknown DynamoOperation action: '{op.action}'")
 
     def run_transaction(self, operations_list: List[Any]):
         """Execute operations as a single DynamoDB ACID transaction.
@@ -213,21 +348,25 @@ class DynamoDbAdapter(DbAdapter):
             return
 
         ops = self._validate_transaction_operations(ops)
+        self._validate_transaction_item_count(ops)
+        source_write_guards = self._source_write_guards(ops)
         connection = self._get_connection(ops[0].model)
 
         try:
             with TransactWrite(connection=connection) as transaction:
                 for op in ops:
+                    resolved_op = op
                     if op.action == "audit_save":
-                        op = self._resolve_audit_operation(op)
-                        if op is None:
+                        resolved_op = self._resolve_audit_operation(op)
+                        if resolved_op is None:
                             continue
+                        if not self._is_source_guarded_by_write(op, source_write_guards):
+                            self._add_source_condition_check(transaction, op)
 
-                    if op.action == "save":
-                        transaction.save(op.model, condition=op.condition)
-                    else:
-                        transaction.delete(op.model, condition=op.condition)
+                    self._apply_transaction_operation(transaction, resolved_op)
         except TransactWriteError:
+            raise
+        except ValueError:
             raise
         except Exception as e:
             raise RuntimeError(f"Transaction failed: {e}") from e
@@ -243,8 +382,7 @@ class DynamoDbAdapter(DbAdapter):
         return response
 
     def get_one(self, table: str, conditions: Dict[str, Any], sort: List[Tuple[str, str]] = None, model_cls: Type[BaseModel] = None) -> Dict[str, Any]:
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB get_one")
+        model_cls = self._resolve_model_cls(table, model_cls)
             
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         try:
@@ -257,8 +395,7 @@ class DynamoDbAdapter(DbAdapter):
              raise RuntimeError(f"get_one failed: {e}")
 
     def get_many(self, table: str, conditions: Dict[str, Any] = None, sort: List[Tuple[str, str]] = None, limit: int = 100, model_cls: Type[BaseModel] = None) -> List[Dict[str, Any]]:
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB get_many")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         try:
@@ -268,8 +405,7 @@ class DynamoDbAdapter(DbAdapter):
             raise RuntimeError(f"get_many failed: {e}")
 
     def get_count(self, table: str, conditions: Dict[str, Any], options: Optional[Dict[str, Any]] = None, model_cls: Type[BaseModel] = None) -> int:
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB get_count")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         try:
@@ -292,8 +428,7 @@ class DynamoDbAdapter(DbAdapter):
         aborts the whole transaction if another writer changes the source row
         after the audit snapshot read.
         """
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB move_entity_to_audit_table")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         audit_table_name = f"{table}_audit"
@@ -309,8 +444,7 @@ class DynamoDbAdapter(DbAdapter):
         )
 
     def move_entity_to_audit_table(self, table_name: str, entity_id: str, model_cls: Type[BaseModel] = None):
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB move_entity_to_audit_table")
+        model_cls = self._resolve_model_cls(table_name, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table_name, model_cls)
         audit_table_name = f"{table_name}_audit"
@@ -326,8 +460,7 @@ class DynamoDbAdapter(DbAdapter):
             raise RuntimeError(f"move_entity_to_audit_table failed: {e}")
 
     def get_save_query(self, table: str, data: Dict[str, Any], model_cls: Type[BaseModel] = None):
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB save")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         item = pynamo_model(**data)
@@ -336,23 +469,32 @@ class DynamoDbAdapter(DbAdapter):
         # - New records have previous_version == ZERO_UUID (set by prepare_for_save)
         # - Updated records have previous_version == the previous stored version
         previous_version = data.get("previous_version")
+        if "version" in data and previous_version is None:
+            raise RuntimeError(
+                "Versioned DynamoDB save requires previous_version; use get_uuid_hex(0) for creates"
+            )
+        if "version" in data and previous_version == "":
+            raise RuntimeError("Versioned DynamoDB save requires non-empty previous_version")
+
         if previous_version and previous_version != get_uuid_hex(0):
             # PynamoDB exposes condition-capable attributes on the model class.
             # Instance-level values are plain Python data and cannot build expressions.
-            version_attr = getattr(pynamo_model, "version", None)
-            if not isinstance(version_attr, Attribute):
-                raise RuntimeError(
-                    f"Versioned DynamoDB save for table '{table}' requires a PynamoDB 'version' attribute"
-                )
-            condition = (version_attr == previous_version)
+            condition = self._version_condition(pynamo_model, previous_version)
+            operation_expected_version = previous_version
         else:
             condition = pynamo_model.entity_id.does_not_exist()
+            operation_expected_version = None
 
-        return DynamoOperation("save", item, condition=condition)
+        return DynamoOperation(
+            "save",
+            item,
+            condition=condition,
+            entity_id=data.get("entity_id"),
+            expected_version=operation_expected_version
+        )
 
     def save(self, table: str, data: Dict[str, Any], model_cls: Type[BaseModel] = None) -> Union[Dict[str, Any], None]:
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB save")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         item = pynamo_model(**data)
@@ -366,8 +508,7 @@ class DynamoDbAdapter(DbAdapter):
         model_cls: Type[BaseModel] = None,
         consistent_read: bool = False
     ) -> Optional[Dict[str, Any]]:
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB get_by_id")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         try:
@@ -395,8 +536,7 @@ class DynamoDbAdapter(DbAdapter):
             ValueError: If model_cls is not provided.
             RuntimeError: If entity_id is missing or any DynamoDB operation fails.
         """
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB upsert")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         if 'entity_id' not in data:
             raise RuntimeError("upsert failed: 'entity_id' is required in data")
@@ -410,8 +550,7 @@ class DynamoDbAdapter(DbAdapter):
             raise RuntimeError(f"upsert failed: {e}")
 
     def delete(self, table: str, data: Dict[str, Any], model_cls: Type[BaseModel] = None) -> bool:
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB delete")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         entity_id = data.get('entity_id')
@@ -427,8 +566,7 @@ class DynamoDbAdapter(DbAdapter):
 
     def hard_delete(self, table: str, entity_id: str, model_cls: Type[BaseModel] = None) -> bool:
         """Permanently deletes a record from the specified table by entity_id."""
-        if model_cls is None:
-            raise ValueError("model_cls is required for DynamoDB hard_delete")
+        model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)
         try:

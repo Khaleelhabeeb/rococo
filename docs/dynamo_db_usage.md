@@ -117,15 +117,17 @@ This means:
 - Either both the audit record and the new version are written, or neither is.
 - Updates use an optimistic-lock condition based on `previous_version`.
 - Creates use a "must not already exist" condition on `entity_id`.
+- Transactions are validated before execution against DynamoDB's 100-item limit.
 
 The audit snapshot is read with a strongly consistent `GetItem` during
 transaction execution, then the main-table write condition verifies that the
 source row is still at the expected `previous_version` when DynamoDB commits
 the `TransactWriteItems` request. DynamoDB does not support reading an item and
-writing a derived audit copy in a single transaction action, so this
-previous-version condition is the ACID guard: if another writer updates the row
-between the audit read and the commit, the whole transaction is rejected and no
-audit row is written.
+writing a derived audit copy in a single transaction action. For repository
+saves, the main-table write condition is the ACID guard; for audit-only
+transaction operations, Rococo adds a source-row `ConditionCheck`. If another
+writer updates the row between the audit read and the commit, the whole
+transaction is rejected and no audit row is written.
 
 After a versioned transaction succeeds, the repository performs a strongly
 consistent read of the saved item and hydrates the model from the committed

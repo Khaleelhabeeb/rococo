@@ -45,7 +45,7 @@ class DynamoDbRepository(BaseRepository):
         )
         return data
 
-    def _read_committed_state(self, entity_id: str) -> Dict[str, Any]:
+    def _read_committed_state(self, entity_id: str, expected_version: str = None) -> Dict[str, Any]:
         saved = self._execute_within_context(
             lambda: self.adapter.get_by_id(
                 table=self.table_name,
@@ -57,6 +57,11 @@ class DynamoDbRepository(BaseRepository):
         if not saved:
             raise RuntimeError(
                 f"DynamoDB transaction committed but entity_id={entity_id} could not be read back"
+            )
+        if expected_version is not None and saved.get("version") != expected_version:
+            raise RuntimeError(
+                f"DynamoDB transaction committed version={expected_version}, "
+                f"but read back version={saved.get('version')} for entity_id={entity_id}"
             )
         return saved
 
@@ -147,7 +152,7 @@ class DynamoDbRepository(BaseRepository):
             )
 
             self._execute_within_context(lambda: self.adapter.run_transaction(ops))
-            saved = self._read_committed_state(payload["entity_id"])
+            saved = self._read_committed_state(payload["entity_id"], expected_version=payload.get("version"))
         else:
             saved = self._execute_within_context(
                 lambda: self.adapter.upsert(self.table_name, payload, model_cls=self.model)
@@ -218,7 +223,7 @@ class DynamoDbRepository(BaseRepository):
             )
 
             self._execute_within_context(lambda: self.adapter.run_transaction(ops))
-            saved = self._read_committed_state(data["entity_id"])
+            saved = self._read_committed_state(data["entity_id"], expected_version=data.get("version"))
 
             if saved:
                 for k, v in saved.items():

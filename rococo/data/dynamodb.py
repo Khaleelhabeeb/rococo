@@ -11,9 +11,20 @@ from rococo.data.base import DbAdapter
 from rococo.models import BaseModel
 from rococo.models.versioned_model import get_uuid_hex
 
-__all__ = ["DynamoDbAdapter", "DynamoOperation"]
+__all__ = ["DynamoDbAdapter", "DynamoOperation", "DynamoPostCommitVersionMismatch"]
 
 MAX_TRANSACTION_ITEMS = 100
+
+
+class DynamoPostCommitVersionMismatch(RuntimeError):
+    """Raised when the strongly-consistent read-back after a successful transaction
+    commit returns a different version than expected.
+
+    This indicates a subsequent writer overwrote the committed state between the
+    transaction commit and the read-back. Callers can catch this specifically to
+    distinguish post-commit races from other RuntimeErrors.
+    """
+    pass
 
 
 @dataclass
@@ -33,7 +44,18 @@ class DynamoOperation:
 
 
 class DynamoDbAdapter(DbAdapter):
-    """DynamoDB adapter using PynamoDB with dynamic model generation."""
+    """DynamoDB adapter using PynamoDB with dynamic model generation.
+
+    Thread-safety contract:
+        The internal ``_pynamo_models`` and ``_connections`` caches use plain dicts
+        with a check-then-set pattern that is **not** atomic under concurrent access.
+        If the adapter instance is shared across threads (e.g., in a web server),
+        two threads may both create a model class or connection for the same key,
+        with one being silently discarded. This is benign (no data corruption or
+        incorrect behaviour) but wastes one redundant connection setup. If strict
+        single-instantiation semantics are required, callers should synchronize
+        access externally or use one adapter instance per thread.
+    """
 
     def __init__(self):
         self._connections: Dict[str, Connection] = {}
@@ -319,6 +341,24 @@ class DynamoDbAdapter(DbAdapter):
         return version_attr == expected_version
 
     def _resolve_audit_operation(self, op: DynamoOperation) -> DynamoOperation:
+        """Resolve a deferred audit_save into a concrete save operation.
+
+        TOCTOU note:
+            The audit snapshot is read via a strongly-consistent GetItem *before*
+            the TransactWrite batch is committed. Between this read and the commit,
+            a concurrent writer could change non-version fields on the source row.
+            The version condition (ConditionCheck or same-row save condition) guards
+            against a stale *version* being committed — if the version changes, the
+            transaction aborts. However, non-version field changes that do not
+            alter the version will slip through silently into the audit snapshot.
+
+            This is an inherent limitation of DynamoDB's TransactWriteItems API,
+            which does not support read-then-write within a single atomic action.
+            Only version integrity is guaranteed; field-level consistency of the
+            audit snapshot is best-effort.
+
+        See: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html
+        """
         if op.audit_model is None or op.entity_id is None:
             raise RuntimeError("Dynamo audit operation requires audit_model and entity_id")
         if op.expected_version is None or op.expected_version == "":
@@ -366,7 +406,15 @@ class DynamoDbAdapter(DbAdapter):
         ops = self._validate_transaction_operations(ops)
         self._validate_transaction_item_count(ops)
         source_write_guards = self._source_write_guards(ops)
-        connection = self._get_connection(ops[0].model)
+
+        # Derive connection from the first save/delete op (which always carries a
+        # concrete model instance) rather than ops[0] which may be an audit_save
+        # class with potentially different Meta region/host.
+        connection_source = next(
+            (op.model for op in ops if op.action in {"save", "delete"}),
+            ops[0].model
+        )
+        connection = self._get_connection(connection_source)
 
         try:
             with TransactWrite(connection=connection) as transaction:
@@ -378,11 +426,7 @@ class DynamoDbAdapter(DbAdapter):
                             self._add_source_condition_check(transaction, op)
 
                     self._apply_transaction_operation(transaction, resolved_op)
-        except TransactWriteError:
-            raise
-        except ValueError:
-            raise
-        except RuntimeError:
+        except (TransactWriteError, ValueError, RuntimeError):
             raise
         except Exception as e:
             raise RuntimeError(f"Transaction failed: {e}") from e
@@ -408,7 +452,7 @@ class DynamoDbAdapter(DbAdapter):
                 return item.attribute_values
             return None
         except Exception as e:
-             raise RuntimeError(f"get_one failed: {e}")
+            raise RuntimeError(f"get_one failed: {e}")
 
     def get_many(self, table: str, conditions: Dict[str, Any] = None, sort: List[Tuple[str, str]] = None, limit: int = 100, model_cls: Type[BaseModel] = None) -> List[Dict[str, Any]]:
         model_cls = self._resolve_model_cls(table, model_cls)
@@ -487,7 +531,7 @@ class DynamoDbAdapter(DbAdapter):
         previous_version = data.get("previous_version")
         if "version" in data and previous_version is None:
             raise RuntimeError(
-                "Versioned DynamoDB save requires previous_version; use get_uuid_hex(0) for creates"
+                "Versioned DynamoDB save requires previous_version; for new records it must be the zero UUID sentinel"
             )
         if "version" in data and previous_version == "":
             raise RuntimeError("Versioned DynamoDB save requires non-empty previous_version")
@@ -510,6 +554,22 @@ class DynamoDbAdapter(DbAdapter):
         )
 
     def save(self, table: str, data: Dict[str, Any], model_cls: Type[BaseModel] = None) -> Union[Dict[str, Any], None]:
+        """Unconditional PutItem save. NOT safe for versioned models.
+
+        For versioned models, use get_save_query() + run_transaction() which
+        applies optimistic locking conditions. This method performs a plain
+        PutItem with no version guard and will silently overwrite concurrent
+        changes.
+
+        Raises:
+            RuntimeError: If data contains a 'version' field, indicating a
+                versioned model that should use the transactional save path.
+        """
+        if "version" in data:
+            raise RuntimeError(
+                "save() must not be used for versioned models — it bypasses optimistic locking. "
+                "Use get_save_query() + run_transaction() instead."
+            )
         model_cls = self._resolve_model_cls(table, model_cls)
 
         pynamo_model = self._generate_pynamo_model(table, model_cls)

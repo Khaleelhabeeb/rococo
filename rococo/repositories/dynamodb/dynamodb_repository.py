@@ -2,7 +2,7 @@ import json
 import logging
 from uuid import UUID
 from typing import Any, Dict, List, Optional, Type, Tuple
-from rococo.data.dynamodb import DynamoDbAdapter
+from rococo.data.dynamodb import DynamoDbAdapter, DynamoPostCommitVersionMismatch
 from rococo.messaging import MessageAdapter
 from rococo.repositories import BaseRepository
 from rococo.models.versioned_model import BaseModel, VersionedModel, get_uuid_hex
@@ -59,7 +59,7 @@ class DynamoDbRepository(BaseRepository):
                 f"DynamoDB transaction committed but entity_id={entity_id} could not be read back"
             )
         if expected_version is not None and saved.get("version") != expected_version:
-            raise RuntimeError(
+            raise DynamoPostCommitVersionMismatch(
                 f"DynamoDB write succeeded with version={expected_version}, but the strongly consistent "
                 f"read-back returned version={saved.get('version')} for entity_id={entity_id}. "
                 "The committed write may have been superseded by a subsequent writer; do not retry blindly."
@@ -135,14 +135,14 @@ class DynamoDbRepository(BaseRepository):
             if self.use_audit_table:
                 previous_version = getattr(instance, 'previous_version', None)
                 if previous_version is not None and previous_version != get_uuid_hex(0):
-                    audit_op = self.adapter.get_move_entity_to_audit_table_query(
-                        self.table_name,
-                        instance.entity_id,
-                        model_cls=self.model,
-                        expected_version=previous_version
+                    ops.append(
+                        self.adapter.get_move_entity_to_audit_table_query(
+                            self.table_name,
+                            instance.entity_id,
+                            model_cls=self.model,
+                            expected_version=previous_version
+                        )
                     )
-                    if audit_op:
-                        ops.append(audit_op)
 
             ops.append(
                 self.adapter.get_save_query(
@@ -206,14 +206,14 @@ class DynamoDbRepository(BaseRepository):
             if self.use_audit_table:
                 previous_version = getattr(instance, 'previous_version', None)
                 if previous_version is not None and previous_version != get_uuid_hex(0):
-                    audit_op = self.adapter.get_move_entity_to_audit_table_query(
-                        self.table_name,
-                        data['entity_id'],
-                        model_cls=self.model,
-                        expected_version=previous_version
+                    ops.append(
+                        self.adapter.get_move_entity_to_audit_table_query(
+                            self.table_name,
+                            data['entity_id'],
+                            model_cls=self.model,
+                            expected_version=previous_version
+                        )
                     )
-                    if audit_op:
-                        ops.append(audit_op)
 
             ops.append(
                 self.adapter.get_save_query(
@@ -232,12 +232,8 @@ class DynamoDbRepository(BaseRepository):
                         setattr(instance, k, v)
         else:
             # Hard delete for non-versioned models
-            with self.adapter:
-                pynamo_model = self.adapter._generate_pynamo_model(self.table_name, self.model)
-                try:
-                    item = pynamo_model.get(instance.entity_id)
-                    item.delete()
-                except Exception as e:
-                    self.logger.warning(f"Could not delete entity: {e}")
+            self._execute_within_context(
+                lambda: self.adapter.hard_delete(self.table_name, instance.entity_id, model_cls=self.model)
+            )
 
         return instance

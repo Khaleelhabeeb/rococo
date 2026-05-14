@@ -7,7 +7,7 @@ from typing import Type
 from pynamodb.models import Model
 from pynamodb.attributes import UnicodeAttribute, BooleanAttribute
 from pynamodb.exceptions import DoesNotExist, TransactWriteError
-from rococo.data.dynamodb import DynamoDbAdapter, DynamoOperation
+from rococo.data.dynamodb import DynamoDbAdapter, DynamoOperation, DynamoPostCommitVersionMismatch
 from rococo.repositories.dynamodb.dynamodb_repository import DynamoDbRepository
 from rococo.models.versioned_model import VersionedModel, get_uuid_hex
 from rococo.messaging import MessageAdapter
@@ -407,7 +407,7 @@ class TestDynamoDbRepository(unittest.TestCase):
             'version': uuid4().hex,
         }
 
-        with self.assertRaisesRegex(RuntimeError, "requires previous_version"):
+        with self.assertRaisesRegex(RuntimeError, "zero UUID sentinel"):
             self.adapter.get_save_query('person', data, model_cls=Person)
 
     def test_get_save_query_rejects_empty_previous_version_for_versioned_data(self):
@@ -540,8 +540,9 @@ class TestDynamoDbRepository(unittest.TestCase):
                 'version': uuid4().hex,
             }
 
-            with self.assertRaisesRegex(RuntimeError, "write succeeded"):
+            with self.assertRaises(DynamoPostCommitVersionMismatch) as context:
                 self.repository._read_committed_state(entity_id, expected_version=expected_version)
+            self.assertIn("write succeeded", str(context.exception))
 
     def test_session_token_connections_are_not_cached(self):
         adapter = DynamoDbAdapter()
@@ -560,6 +561,61 @@ class TestDynamoDbRepository(unittest.TestCase):
         from rococo.data import DynamoOperation as ExportedDynamoOperation
 
         self.assertIs(ExportedDynamoOperation, DynamoOperation)
+
+    def test_post_commit_version_mismatch_is_publicly_exported(self):
+        from rococo.data import DynamoPostCommitVersionMismatch as Exported
+
+        self.assertIs(Exported, DynamoPostCommitVersionMismatch)
+
+    def test_save_rejects_versioned_data(self):
+        data = {
+            'entity_id': uuid4().hex,
+            'version': uuid4().hex,
+            'previous_version': uuid4().hex,
+            'first_name': 'Jane',
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "must not be used for versioned models"):
+            self.adapter.save('person', data, model_cls=Person)
+
+    def test_save_allows_non_versioned_data(self):
+        data = {
+            'entity_id': uuid4().hex,
+            'first_name': 'Jane',
+        }
+
+        with patch.object(PersonModel, 'save') as mock_save:
+            result = self.adapter.save('person', data, model_cls=Person)
+
+        self.assertIsNotNone(result)
+        mock_save.assert_called_once()
+
+    def test_run_transaction_derives_connection_from_save_op(self):
+        """Connection should be derived from the first save/delete op, not ops[0] if it's audit_save."""
+        entity_id = uuid4().hex
+        old_version = uuid4().hex
+
+        audit_op = self.adapter.get_move_entity_to_audit_table_query(
+            'person', entity_id, model_cls=Person, expected_version=old_version
+        )
+        save_op = DynamoOperation("save", PersonModel(entity_id=entity_id))
+
+        with patch.object(PersonModel, 'get') as mock_get:
+            mock_item = MagicMock()
+            mock_item.attribute_values = {'entity_id': entity_id, 'version': old_version}
+            mock_get.return_value = mock_item
+
+            with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+                mock_tx = MagicMock()
+                mock_transact_write.return_value.__enter__.return_value = mock_tx
+
+                with patch.object(self.adapter, '_get_connection') as mock_get_conn:
+                    mock_get_conn.return_value = MagicMock()
+                    self.adapter.run_transaction([audit_op, save_op])
+
+                # Connection should be derived from save_op.model (the PersonModel instance)
+                called_with = mock_get_conn.call_args[0][0]
+                self.assertIsInstance(called_with, PersonModel)
 
 
 if __name__ == '__main__':

@@ -30,8 +30,8 @@ except ImportError:
     pass
 
 try:
-    from .dynamodb import DynamoDbAdapter, DynamoOperation
-    __all__.extend(["DynamoDbAdapter", "DynamoOperation"])
+    from .dynamodb import DynamoDbAdapter, DynamoOperation, DynamoPostCommitVersionMismatch
+    __all__.extend(["DynamoDbAdapter", "DynamoOperation", "DynamoPostCommitVersionMismatch"])
 except ImportError:
     logger.info("DynamoDbAdapter not loaded - probably, missing dependencies")
     pass

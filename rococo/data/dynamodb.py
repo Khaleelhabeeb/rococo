@@ -27,9 +27,9 @@ class DynamoOperation:
     action: str
     model: Union[Model, Type[Model]]
     condition: Any = None
-    audit_model: Type[Model] = None
-    entity_id: str = None
-    expected_version: str = None
+    audit_model: Optional[Type[Model]] = None
+    entity_id: Optional[str] = None
+    expected_version: Optional[str] = None
 
 
 class DynamoDbAdapter(DbAdapter):
@@ -64,15 +64,23 @@ class DynamoDbAdapter(DbAdapter):
         # Default to UnicodeAttribute for str and others
         return UnicodeAttribute(**kwargs)
 
-    def _model_cache_digest(
+    def _cache_digest(
         self,
+        purpose: str,
         region: Optional[str],
         host: Optional[str],
         aws_access_key_id: Optional[str],
         aws_secret_access_key: Optional[str]
     ) -> str:
+        """Return an opaque cache key.
+
+        Session tokens are intentionally omitted because temporary credentials
+        are not cached. The purpose prefix prevents model-cache and connection-
+        cache keys from sharing the same digest namespace.
+        """
         key_material = "\x1f".join(
             value or "" for value in (
+                purpose,
                 region,
                 host,
                 aws_access_key_id,
@@ -80,6 +88,21 @@ class DynamoDbAdapter(DbAdapter):
             )
         )
         return hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+
+    def _model_cache_digest(
+        self,
+        region: Optional[str],
+        host: Optional[str],
+        aws_access_key_id: Optional[str],
+        aws_secret_access_key: Optional[str]
+    ) -> str:
+        return self._cache_digest(
+            "model",
+            region,
+            host,
+            aws_access_key_id,
+            aws_secret_access_key
+        )
 
     def _resolve_model_cls(self, table_name: str, model_cls: Type[BaseModel] = None) -> Type[BaseModel]:
         if model_cls is not None:
@@ -177,15 +200,13 @@ class DynamoDbAdapter(DbAdapter):
         aws_access_key_id: Optional[str],
         aws_secret_access_key: Optional[str]
     ) -> str:
-        key_material = "\x1f".join(
-            value or "" for value in (
-                region,
-                host,
-                aws_access_key_id,
-                aws_secret_access_key
-            )
+        return self._cache_digest(
+            "connection",
+            region,
+            host,
+            aws_access_key_id,
+            aws_secret_access_key
         )
-        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()
 
     def _get_connection(self, model: Union[Model, Type[Model]]) -> Connection:
         meta = getattr(model, "Meta", None)
@@ -297,26 +318,19 @@ class DynamoDbAdapter(DbAdapter):
             )
         return version_attr == expected_version
 
-    def _resolve_audit_operation(self, op: DynamoOperation) -> Optional[DynamoOperation]:
+    def _resolve_audit_operation(self, op: DynamoOperation) -> DynamoOperation:
         if op.audit_model is None or op.entity_id is None:
             raise RuntimeError("Dynamo audit operation requires audit_model and entity_id")
         if op.expected_version is None or op.expected_version == "":
             raise RuntimeError("Dynamo audit operation requires a non-empty expected_version")
 
-        # DynamoDB cannot read an item and write a derived audit copy in one
-        # TransactWrite action. The source read is therefore deferred until
-        # transaction execution, verified against the expected version here,
-        # and guarded again by the main-table save condition in the same write.
+        # Best-effort snapshot read. The authoritative ACID boundary is the
+        # later same-row save condition or audit-only ConditionCheck.
         try:
             item = op.model.get(op.entity_id, consistent_read=True)
         except DoesNotExist:
-            return None
-
-        item_version = item.attribute_values.get("version")
-        if op.expected_version is not None and item_version != op.expected_version:
             raise RuntimeError(
-                f"DynamoDB audit snapshot version mismatch for entity_id={op.entity_id}: "
-                f"expected {op.expected_version}, found {item_version}"
+                f"DynamoDB audit snapshot source entity_id={op.entity_id} does not exist"
             )
 
         audit_item = op.audit_model(**item.attribute_values)
@@ -335,6 +349,8 @@ class DynamoDbAdapter(DbAdapter):
         elif op.action == "delete":
             transaction.delete(op.model, condition=op.condition)
         else:
+            # Defensive unreachable path: run_transaction validates actions and
+            # audit_save operations are resolved before dispatch.
             raise ValueError(f"Unknown DynamoOperation action: '{op.action}'")
 
     def run_transaction(self, operations_list: List[Any]):
@@ -358,8 +374,6 @@ class DynamoDbAdapter(DbAdapter):
                     resolved_op = op
                     if op.action == "audit_save":
                         resolved_op = self._resolve_audit_operation(op)
-                        if resolved_op is None:
-                            continue
                         if not self._is_source_guarded_by_write(op, source_write_guards):
                             self._add_source_condition_check(transaction, op)
 
@@ -367,6 +381,8 @@ class DynamoDbAdapter(DbAdapter):
         except TransactWriteError:
             raise
         except ValueError:
+            raise
+        except RuntimeError:
             raise
         except Exception as e:
             raise RuntimeError(f"Transaction failed: {e}") from e
@@ -476,7 +492,7 @@ class DynamoDbAdapter(DbAdapter):
         if "version" in data and previous_version == "":
             raise RuntimeError("Versioned DynamoDB save requires non-empty previous_version")
 
-        if previous_version and previous_version != get_uuid_hex(0):
+        if previous_version is not None and previous_version != get_uuid_hex(0):
             # PynamoDB exposes condition-capable attributes on the model class.
             # Instance-level values are plain Python data and cannot build expressions.
             condition = self._version_condition(pynamo_model, previous_version)

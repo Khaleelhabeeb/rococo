@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch, ANY
 from typing import Type
 from pynamodb.models import Model
 from pynamodb.attributes import UnicodeAttribute, BooleanAttribute
-from pynamodb.exceptions import TransactWriteError
+from pynamodb.exceptions import DoesNotExist, TransactWriteError
 from rococo.data.dynamodb import DynamoDbAdapter, DynamoOperation
 from rococo.repositories.dynamodb.dynamodb_repository import DynamoDbRepository
 from rococo.models.versioned_model import VersionedModel, get_uuid_hex
@@ -276,7 +276,7 @@ class TestDynamoDbRepository(unittest.TestCase):
         self.assertEqual(operation.entity_id, entity_id)
         self.assertEqual(operation.expected_version, old_version)
 
-    def test_audit_operation_rejects_snapshot_version_mismatch(self):
+    def test_audit_operation_defers_snapshot_version_mismatch_to_transaction_condition(self):
         entity_id = uuid4().hex
         old_version = uuid4().hex
         operation = self.adapter.get_move_entity_to_audit_table_query(
@@ -298,9 +298,30 @@ class TestDynamoDbRepository(unittest.TestCase):
                 mock_tx = MagicMock()
                 mock_transact_write.return_value.__enter__.return_value = mock_tx
 
-                with self.assertRaisesRegex(RuntimeError, "audit snapshot version mismatch"):
+                self.adapter.run_transaction([operation])
+
+        mock_tx.condition_check.assert_called_once()
+        self.assertIn(old_version, str(mock_tx.condition_check.call_args.kwargs["condition"]))
+        mock_tx.save.assert_called_once()
+
+    def test_audit_operation_rejects_missing_source_item(self):
+        entity_id = uuid4().hex
+        operation = self.adapter.get_move_entity_to_audit_table_query(
+            'person',
+            entity_id,
+            model_cls=Person,
+            expected_version=uuid4().hex
+        )
+
+        with patch.object(PersonModel, 'get', side_effect=DoesNotExist()):
+            with patch('rococo.data.dynamodb.TransactWrite') as mock_transact_write:
+                mock_tx = MagicMock()
+                mock_transact_write.return_value.__enter__.return_value = mock_tx
+
+                with self.assertRaisesRegex(RuntimeError, "does not exist"):
                     self.adapter.run_transaction([operation])
 
+        mock_tx.condition_check.assert_not_called()
         mock_tx.save.assert_not_called()
 
     def test_audit_operation_rejects_empty_expected_version(self):
@@ -447,6 +468,7 @@ class TestDynamoDbRepository(unittest.TestCase):
         adapter = DynamoDbAdapter()
         operation = DynamoOperation("save", PersonModel(entity_id=uuid4().hex))
 
+        # Empty string simulates no temporary session token.
         with patch.dict(os.environ, {'AWS_SESSION_TOKEN': ''}):
             with patch('rococo.data.dynamodb.Connection') as mock_connection:
                 with patch('rococo.data.dynamodb.TransactWrite'):
@@ -467,9 +489,19 @@ class TestDynamoDbRepository(unittest.TestCase):
 
         self.assertNotIn(secret, repr(adapter._connections))
 
+    def test_model_and_connection_cache_keys_use_separate_namespaces(self):
+        adapter = DynamoDbAdapter()
+        args = ("us-east-1", None, "testing", "secret")
+
+        self.assertNotEqual(
+            adapter._model_cache_digest(*args),
+            adapter._connection_cache_key(*args)
+        )
+
     def test_generated_pynamo_model_is_cached_without_session_token(self):
         adapter = DynamoDbAdapter()
 
+        # Empty string simulates no temporary session token.
         with patch.dict(os.environ, {'AWS_SESSION_TOKEN': ''}):
             first_model = adapter._generate_pynamo_model('person', Person)
             second_model = adapter._generate_pynamo_model('person', Person)
@@ -508,7 +540,7 @@ class TestDynamoDbRepository(unittest.TestCase):
                 'version': uuid4().hex,
             }
 
-            with self.assertRaisesRegex(RuntimeError, "read back version"):
+            with self.assertRaisesRegex(RuntimeError, "write succeeded"):
                 self.repository._read_committed_state(entity_id, expected_version=expected_version)
 
     def test_session_token_connections_are_not_cached(self):

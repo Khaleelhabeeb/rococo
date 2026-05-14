@@ -45,7 +45,7 @@ class DynamoDbRepository(BaseRepository):
         )
         return data
 
-    def _read_committed_state(self, entity_id: str, expected_version: str = None) -> Dict[str, Any]:
+    def _read_committed_state(self, entity_id: str, expected_version: Optional[str] = None) -> Dict[str, Any]:
         saved = self._execute_within_context(
             lambda: self.adapter.get_by_id(
                 table=self.table_name,
@@ -60,8 +60,9 @@ class DynamoDbRepository(BaseRepository):
             )
         if expected_version is not None and saved.get("version") != expected_version:
             raise RuntimeError(
-                f"DynamoDB transaction committed version={expected_version}, "
-                f"but read back version={saved.get('version')} for entity_id={entity_id}"
+                f"DynamoDB write succeeded with version={expected_version}, but the strongly consistent "
+                f"read-back returned version={saved.get('version')} for entity_id={entity_id}. "
+                "The committed write may have been superseded by a subsequent writer; do not retry blindly."
             )
         return saved
 
@@ -133,7 +134,7 @@ class DynamoDbRepository(BaseRepository):
 
             if self.use_audit_table:
                 previous_version = getattr(instance, 'previous_version', None)
-                if previous_version and previous_version != get_uuid_hex(0):
+                if previous_version is not None and previous_version != get_uuid_hex(0):
                     audit_op = self.adapter.get_move_entity_to_audit_table_query(
                         self.table_name,
                         instance.entity_id,
@@ -204,7 +205,7 @@ class DynamoDbRepository(BaseRepository):
 
             if self.use_audit_table:
                 previous_version = getattr(instance, 'previous_version', None)
-                if previous_version and previous_version != get_uuid_hex(0):
+                if previous_version is not None and previous_version != get_uuid_hex(0):
                     audit_op = self.adapter.get_move_entity_to_audit_table_query(
                         self.table_name,
                         data['entity_id'],
